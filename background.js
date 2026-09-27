@@ -1,6 +1,15 @@
 const JOB_PREFIX = "jobState:";
+const TAB_APP_PREFIX = "tabApplication:";
 let refreshInFlight = null;
 const activeGenerations = new Map();
+
+// Workflow status belongs to the application lifecycle. Page navigation and
+// Page Agent observations must never overwrite a completed/generating resume
+// state. Page lifecycle is stored separately in pageStatus.
+const WORKFLOW_STATUSES = new Set(["ready", "generating", "completed", "downloaded", "failed"]);
+function preserveWorkflowStatus(currentStatus, fallback = "page_ready") {
+  return WORKFLOW_STATUSES.has(currentStatus) ? currentStatus : fallback;
+}
 
 function normalizeJobUrl(value) {
   return String(value || "").trim().toLowerCase().replace(/#.*$/, "").replace(/\?$/, "").replace(/\/$/, "");
@@ -117,12 +126,246 @@ async function apiFetch(path, options = {}) {
   return response;
 }
 
+async function getApplicationBinding(tabId) {
+  const key = `${TAB_APP_PREFIX}${tabId}`;
+  const data = await chrome.storage.local.get(key);
+  return data[key] || null;
+}
+
+async function setApplicationBinding(tabId, applicationId, pageUrl = null) {
+  const key = `${TAB_APP_PREFIX}${tabId}`;
+  if (!applicationId) {
+    await chrome.storage.local.remove(key);
+    return;
+  }
+  await chrome.storage.local.set({ [key]: { applicationId, pageUrl: pageUrl || null, updatedAt: Date.now() } });
+}
+
+
+const APPLICATION_URL_PREFIX = "applicationUrl:";
+const APPLICATION_RECENT_KEY = "recentApplicationIds";
+
+const ATS_ADAPTERS = {
+  greenhouse: { name: "Greenhouse", applicationPatterns: [/apply/i, /application/i] },
+  lever: { name: "Lever", applicationPatterns: [/apply/i] },
+  ashby: { name: "Ashby", applicationPatterns: [/application/i, /apply/i] },
+  workday: { name: "Workday", applicationPatterns: [/apply/i, /application/i] },
+  smartrecruiters: { name: "SmartRecruiters", applicationPatterns: [/apply/i, /application/i] },
+  icims: { name: "iCIMS", applicationPatterns: [/apply/i, /application/i] },
+  workable: { name: "Workable", applicationPatterns: [/apply/i, /application/i] },
+  jobvite: { name: "Jobvite", applicationPatterns: [/apply/i, /application/i] },
+  generic: { name: "Generic", applicationPatterns: [/apply/i, /application/i] },
+};
+
+function normalizedApplicationUrl(value) {
+  return normalizeJobUrl(value);
+}
+
+async function rememberApplication(applicationId, urls = []) {
+  if (!applicationId) return;
+  const validUrls = urls.map(normalizedApplicationUrl).filter(Boolean);
+  const writes = {};
+  validUrls.forEach((url) => { writes[`${APPLICATION_URL_PREFIX}${url}`] = applicationId; });
+  const current = await chrome.storage.local.get(APPLICATION_RECENT_KEY);
+  const recent = Array.isArray(current[APPLICATION_RECENT_KEY]) ? current[APPLICATION_RECENT_KEY] : [];
+  writes[APPLICATION_RECENT_KEY] = [applicationId, ...recent.filter((id) => id !== applicationId)].slice(0, 25);
+  await chrome.storage.local.set(writes);
+}
+
+async function resolveApplicationForUrl(url) {
+  const normalized = normalizedApplicationUrl(url);
+  if (!normalized) return null;
+  const key = `${APPLICATION_URL_PREFIX}${normalized}`;
+  const data = await chrome.storage.local.get(key);
+  return data[key] || null;
+}
+
+async function bindApplicationToTab(tabId, applicationId, pageUrl = null) {
+  if (!applicationId) return null;
+  await setApplicationBinding(tabId, applicationId, pageUrl);
+  await rememberApplication(applicationId, [pageUrl]);
+  return { applicationId, tabId };
+}
+
+async function applicationContextForTab(tabId, url = null) {
+  const binding = await getApplicationBinding(tabId);
+  if (binding?.applicationId) return binding.applicationId;
+  const resolved = await resolveApplicationForUrl(url);
+  if (resolved) {
+    await bindApplicationToTab(tabId, resolved, url);
+    return resolved;
+  }
+  return null;
+}
+
+function classifyPage(snapshot) {
+  const site = snapshot?.site || 'generic';
+  const adapter = ATS_ADAPTERS[site] || ATS_ADAPTERS.generic;
+  const pageType = snapshot?.pageType || 'other';
+  return {
+    site,
+    siteName: adapter.name,
+    pageType,
+    isApplication: ['application','questions','review','form'].includes(pageType),
+    isJob: pageType === 'job',
+    isForm: ['application','questions','review','form'].includes(pageType),
+    adapter: site,
+  };
+}
+
+function notifySidePanel(message) {
+  try { chrome.runtime.sendMessage(message).catch(() => {}); } catch {}
+}
+
+async function handlePageAgentSnapshot(tabId, snapshot, eventType = 'PAGE_DETECTED') {
+  if (!tabId || !snapshot?.url) return null;
+  const applicationId = await applicationContextForTab(tabId, snapshot.url);
+  const classification = classifyPage(snapshot);
+  if (!applicationId) {
+    // No application exists yet. Keep page intelligence locally so Capture can
+    // immediately use it, but never invent an application from a page alone.
+    await chrome.storage.session.set({
+      [`pageState:${tabId}`]: { snapshot, classification, updatedAt: Date.now() }
+    });
+    return { applicationId: null, classification };
+  }
+
+  await rememberApplication(applicationId, [snapshot.url]);
+  const job = await getJobState(tabId, snapshot.url);
+  await setJobState(tabId, {
+    pageUrl: snapshot.url,
+    pageType: classification.pageType,
+    pageStatus: classification.pageType || 'detected',
+    ats: classification.site,
+    atsName: classification.siteName,
+    pageSnapshot: snapshot,
+    status: preserveWorkflowStatus(job?.status, 'page_ready'),
+  });
+
+  await syncApplicationState(applicationId, {
+    activeTabId: String(tabId),
+    pageUrl: snapshot.url,
+    pageType: classification.pageType,
+    state: {
+      ats: classification.site,
+      atsName: classification.siteName,
+      currentPageUrl: snapshot.url,
+      pageTitle: snapshot.title,
+      applicationStage: snapshot.applicationStage || null,
+      fieldCount: snapshot.fields?.length || 0,
+    },
+    eventType,
+    eventPayload: {
+      url: snapshot.url,
+      site: classification.site,
+      pageType: classification.pageType,
+      reason: snapshot.reason || null,
+    },
+  });
+  notifySidePanel({
+    type: "APPLICATION_CONTEXT_CHANGED",
+    tabId,
+    applicationId,
+    page: {
+      url: snapshot.url,
+      title: snapshot.title,
+      site: classification.site,
+      siteName: classification.siteName,
+      pageType: classification.pageType,
+      fieldCount: snapshot.fields?.length || 0,
+      reason: snapshot.reason || null
+    }
+  });
+  return { applicationId, classification };
+}
+
+async function syncApplicationState(applicationId, payload = {}) {
+  if (!applicationId) return null;
+  try {
+    const response = await apiFetch('/api/extension/applications/state', {
+      method: 'POST',
+      body: JSON.stringify({ applicationId, ...payload })
+    });
+    if (!response.ok) return null;
+    return response.json().catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
+async function loadApplicationState(applicationId) {
+  if (!applicationId) return null;
+  try {
+    const response = await apiFetch(`/api/extension/applications/state?applicationId=${encodeURIComponent(applicationId)}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Unable to restore application (${response.status}).`);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 async function getJobState(tabId, expectedUrl = null) {
   const key = `${JOB_PREFIX}${tabId}`;
   const data = await chrome.storage.session.get(key);
-  const state = data[key] || null;
+  let state = data[key] || null;
+
+  // Session storage is intentionally only a fast cache. After extension or
+  // browser restart it can be empty, so recover the application from durable
+  // local tab binding + Supabase instead of losing the user's work.
+  if (!state) {
+    const binding = await getApplicationBinding(tabId);
+    let bindingUsable = Boolean(binding?.applicationId);
+    if (bindingUsable) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        const currentUrl = tab?.url || expectedUrl || null;
+        // A live tab binding is authoritative while the tab exists.
+        // ATS flows routinely move from a public JD URL to a different
+        // application URL, sometimes even across origins. The application
+        // identity must follow the tab, not the URL.
+        //
+        // Tab IDs are cleaned up in tabs.onRemoved. Browser-start recovery
+        // is handled by the startup reconciliation below.
+        void currentUrl;
+      } catch {
+        bindingUsable = false;
+      }
+    }
+    if (bindingUsable) {
+      const restored = await loadApplicationState(binding.applicationId);
+      if (restored?.application) {
+        state = {
+          tabId,
+          applicationId: restored.application.id,
+          profileId: restored.application.profile_id,
+          companyName: restored.application.company_name,
+          jobTitle: restored.application.job_title,
+          jobDescription: restored.application.job_description || '',
+          jobUrl: restored.application.job_url || '',
+          jobSite: restored.application.job_site || '',
+          applicationStatus: restored.application.status,
+          resumeVersionId: restored.application.resume_version_id,
+          resumeTemplateId: restored.application.resume_template_id || 'template_1',
+          resumeUsed: restored.application.resume_used,
+          pageUrl: restored.extensionState?.page_url || expectedUrl || restored.application.job_url || '',
+          pageType: restored.extensionState?.page_type || null,
+          restoredAt: Date.now(),
+          status: 'restored',
+          applicationEvents: restored.events || []
+        };
+        await chrome.storage.session.set({ [key]: state });
+      }
+    }
+  }
+
   if (!state) return null;
-  if (expectedUrl && state.jobUrl && normalizeJobUrl(expectedUrl) !== normalizeJobUrl(state.jobUrl)) return null;
+  // URL mismatch is no longer a reason to discard application state. ATS forms
+  // commonly navigate across multiple URLs while remaining one application.
+  if (expectedUrl && state.pageUrl !== expectedUrl) {
+    state = { ...state, pageUrl: expectedUrl };
+    await chrome.storage.session.set({ [key]: state });
+  }
   return state;
 }
 
@@ -131,6 +374,23 @@ async function setJobState(tabId, patch) {
   const current = (await chrome.storage.session.get(key))[key] || { tabId };
   const next = { ...current, ...patch, tabId, updatedAt: Date.now() };
   await chrome.storage.session.set({ [key]: next });
+  if (next.applicationId) {
+    await setApplicationBinding(tabId, next.applicationId, next.pageUrl || next.jobUrl || null);
+    const durableKeys = new Set([
+      'companyName','jobTitle','jobUrl','jobSite','profileId','applicationStatus',
+      'resumeVersionId','resumeTemplateId','coverLetter','coverLetterCost','coverLetterInputTokens','coverLetterOutputTokens','coverLetterGeneratedAt','pageUrl','pageType','pageStatus','status','ats','atsName','pageSnapshot','scan','autofill','applicationAnswers','appliedAt'
+    ]);
+    const durableState = {};
+    for (const [keyName, value] of Object.entries(next)) {
+      if (durableKeys.has(keyName)) durableState[keyName] = value;
+    }
+    void syncApplicationState(next.applicationId, {
+      activeTabId: String(tabId),
+      pageUrl: next.pageUrl || null,
+      pageType: next.pageType || null,
+      state: durableState
+    });
+  }
   return next;
 }
 
@@ -535,7 +795,8 @@ async function scanApplicationForTab(tabId) {
   const job = await getJobState(tabId);
   if (!job?.jobUrl) throw new Error("Capture the current job before scanning the application.");
   const currentTab = await chrome.tabs.get(tabId);
-  if (normalizeJobUrl(currentTab?.url) !== normalizeJobUrl(job.jobUrl)) throw new Error("The job page changed. Capture this job again before scanning.");
+  if (!currentTab?.url) throw new Error("Unable to read the current application page.");
+  await setJobState(tabId, { pageUrl: currentTab.url, pageStatus: 'autofill' });
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
@@ -567,11 +828,13 @@ async function scanApplicationForTab(tabId) {
         return el.tagName.toLowerCase();
       };
       const controls = Array.from(document.querySelectorAll('input,select,textarea,[role="combobox"],[role="radio"],[role="checkbox"],[contenteditable="true"],button[aria-haspopup="listbox"]')).filter(visible);
+      const fieldModel = window.__HERONSOL_FIELD_MODEL__ || {};
+      const controlsForModel = (el, label) => { try { return typeof fieldModel.canonicalField === "function" ? fieldModel.canonicalField(el, label) : null; } catch { return null; } };
       const fields = controls.map((el, index) => {
         const label = labelOf(el);
         const required = !!el.required || el.getAttribute("aria-required") === "true" || /\*/.test(label);
         const questionLike = el instanceof HTMLTextAreaElement || /why|describe|explain|tell us|experience|achievement|interest|motivation|anything else|additional information/i.test(label);
-        return { index, label, type: typeOf(el), required, questionLike, value: clean(el.value || el.textContent || "") };
+        return { index, label, type: typeOf(el), required, questionLike, canonicalField: controlsForModel(el, label), value: clean(el.value || el.textContent || "") };
       }).filter(x => x.label || x.type === "textarea");
       const questions = fields.filter(x => x.questionLike && x.type !== "input:file" && x.label.length > 8);
       const fileFields = fields.filter(x => x.type === "input:file").map(x => ({...x, kind: /cover\s*letter|coverletter|letter/i.test(x.label) ? "cover_letter" : /resume|cv|curriculum/i.test(x.label) ? "resume" : "other"}));
@@ -579,7 +842,7 @@ async function scanApplicationForTab(tabId) {
     }
   });
   const result = results?.[0]?.result || { totalFields: 0, fields: [], questions: [], fileFields: [] };
-  await setJobState(tabId, { scan: result, pageUrl: job.jobUrl, scannedAt: Date.now() });
+  await setJobState(tabId, { scan: result, pageUrl: currentTab.url, pageType: "application", scannedAt: Date.now() });
   return result;
 }
 
@@ -587,13 +850,28 @@ async function autofillForTab(tabId) {
   const job = await getJobState(tabId);
   if (!job?.jobUrl) throw new Error("Capture the current job before autofill.");
   const currentTab = await chrome.tabs.get(tabId);
-  if (normalizeJobUrl(currentTab?.url) !== normalizeJobUrl(job.jobUrl)) throw new Error("The job page changed. Capture this job again before autofill.");
+  if (!currentTab?.url) throw new Error("Unable to read the current application page.");
+  await setJobState(tabId, { pageUrl: currentTab.url });
   if (!job?.profileId || !job?.resumeVersionId) throw new Error("Generate the resume first, then use Autofill.");
 
   const profile = await getAutofillProfile(job.profileId);
   const generatedResume = await getResumeAutofillData(job.resumeVersionId);
   const base64 = await getResumeBase64(job.resumeVersionId);
   const settings = await getExtensionSettings(job.profileId);
+  const autofillSettings = { ...settings };
+  if (job.coverLetter) {
+    const coverBytes = coverLetterDocxBytes(String(job.coverLetter));
+    let coverBinary = "";
+    const coverChunk = 0x8000;
+    for (let i = 0; i < coverBytes.length; i += coverChunk) {
+      coverBinary += String.fromCharCode(...coverBytes.subarray(i, Math.min(i + coverChunk, coverBytes.length)));
+    }
+    autofillSettings.coverLetterFile = {
+      base64: btoa(coverBinary),
+      filename: "Cover Letter.docx",
+      mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    };
+  }
   const safeName = (profile.name || "Resume").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "") || "Resume";
   const resume = { base64, filename: `${safeName}.docx`, content: generatedResume.content || generatedResume };
   const results = await chrome.scripting.executeScript({
@@ -615,6 +893,24 @@ async function autofillForTab(tabId) {
         let p=el.parentElement,d=0; while(p&&d++<3){const t=clean(p.innerText);if(/label|field|question|form-group|form-control|application/i.test(p.className||"")||p.tagName==='LABEL'||p.tagName==='FIELDSET')if(t.length<500)parts.push(t);p=p.parentElement;}
         return normalize(parts.filter(Boolean).join(" | "));
       };
+      const fieldModel = window.__HERONSOL_FIELD_MODEL__ || {};
+      const canonicalField = (el, label) => {
+        try {
+          if (typeof fieldModel.canonicalField === "function") return fieldModel.canonicalField(el, label) || null;
+        } catch {}
+        const n = normalize(`${label || ""} ${el?.name || ""} ${el?.id || ""}`);
+        const aliases = {
+          first_name:/first name|given name|forename|legal first name/, last_name:/last name|surname|family name|legal last name/,
+          full_name:/full name|your name|candidate name/, email:/email|e mail/, phone:/phone|mobile|telephone|tel/,
+          linkedin_url:/linkedin/, github_url:/github/, portfolio_url:/portfolio|personal website|website/, address:/street address|mailing address|address line 1|home address/,
+          city:/\bcity\b/, state:/\bstate\b|province|region/, postal_code:/postal|zip|postcode/, country:/country/,
+          current_employer:/current employer|most recent employer/, current_title:/current job title|most recent job title/,
+          work_authorization:/work authorization|authorized to work|legally authorized|right to work/, sponsorship:/sponsorship|visa sponsorship|require sponsorship/,
+          relocation:/relocation|willing to relocate/, travel:/travel|willing to travel/, desired_salary:/desired salary|salary expectation|expected salary/,
+          start_date:/start date|available to start|availability/, source:/how did you hear|source/, resume:/resume|cv|curriculum/, cover_letter:/cover letter|coverletter/
+        };
+        return Object.entries(aliases).find(([, re]) => re.test(n))?.[0] || null;
+      };
       const optionText = (o) => normalize(`${o?.textContent||""} ${o?.value||""} ${o?.getAttribute?.("aria-label")||""} ${o?.getAttribute?.("data-value")||""}`);
       const matchOption = (nodes, wanted) => { const w=normalize(wanted); if(!w)return null; const a=Array.from(nodes).filter(visible); return a.find(o=>optionText(o)===w)||a.find(o=>optionText(o).startsWith(w+" "))||a.find(o=>optionText(o).includes(w))||null; };
       const state={filled:0,fileUploaded:false,coverLetterUploaded:false,details:[],unresolved:[],ats:location.hostname};
@@ -627,6 +923,17 @@ async function autofillForTab(tabId) {
       const summary=clean(generated.professional_summary||generated.summary||"");
       const answerFor=(label,el)=>{
         const n=normalize(`${label} ${el.name||""}`);
+        const canonical = canonicalField(el, label);
+        const canonicalValues = {
+          first_name:firstName, last_name:lastName, full_name:profileName, email:profileData.email||extensionSettings.email,
+          phone:profileData.phone||extensionSettings.phone, linkedin_url:profileData.linkedin_url, github_url:profileData.github_url,
+          portfolio_url:profileData.portfolio_url||extensionSettings.portfolio_url, address:profileData.address, city:extensionSettings.city||"",
+          state:extensionSettings.state||"", postal_code:extensionSettings.postalCode||"", country:extensionSettings.country||"",
+          current_employer:extensionSettings.currentEmployer||"", current_title:extensionSettings.currentTitle||"",
+          work_authorization:extensionSettings.workAuthorization||"", sponsorship:extensionSettings.sponsorship||"", relocation:extensionSettings.relocation||"",
+          travel:extensionSettings.travel||"", desired_salary:extensionSettings.desiredSalary||"", start_date:extensionSettings.startDate||"", source:extensionSettings.source||""
+        };
+        if (canonical && canonicalValues[canonical]) return String(canonicalValues[canonical]);
         const built=[
           [/first name|given name/,firstName],[/last name|surname|family name/,lastName],[/full name|your name/,profileName],
           [/email|e mail/,profileData.email||extensionSettings.email],[/phone|mobile|telephone|tel/,profileData.phone||extensionSettings.phone],[/linkedin/,profileData.linkedin_url],[/github/,profileData.github_url],
@@ -652,8 +959,11 @@ async function autofillForTab(tabId) {
       for(const el of controls){
         if(el.disabled||el.readOnly||el.dataset.heronsolOwner==="user")continue;
         const label=labelOf(el); if(!label)continue;
+        const canonical = canonicalField(el, label);
         if(el instanceof HTMLInputElement&&el.type==="file"){
-          if(/resume|cv|curriculum/i.test(label)) await upload(el,resumeData,"resume");
+          const kind = canonicalField(el, label);
+          if(kind === "resume") await upload(el,resumeData,"resume");
+          else if(kind === "cover_letter") await upload(el,extensionSettings?.coverLetterFile||null,"cover_letter");
           continue;
         }
         const value=answerFor(label,el);
@@ -661,7 +971,7 @@ async function autofillForTab(tabId) {
         if((el.getAttribute("role")==="combobox"||el.getAttribute("aria-haspopup")==="listbox")&&value){if(await comboValue(el,value))mark(el,`Combobox: ${value}`);else state.unresolved.push({label,type:"combobox"});continue;}
         if((el.type==="radio"||el.getAttribute("role")==="radio")&&value){const group=el.closest('fieldset,[role="radiogroup"],[role="group"]')||el.parentElement;const candidates=group?Array.from(group.querySelectorAll('input[type="radio"],[role="radio"]')):[el];const target=candidates.find(x=>optionText(x)===normalize(value)||optionText(x).includes(normalize(value))||normalize(textOf(x.parentElement)).includes(normalize(value)));if(target){click(target);mark(el,`Radio: ${value}`);}continue;}
         if((el.type==="checkbox"||el.getAttribute("role")==="checkbox")&&value){const yes=/^(yes|true|1|checked)$/i.test(value);if(!!el.checked!==yes)click(el);mark(el,`Checkbox: ${value}`);continue;}
-        if(value&&!(el instanceof HTMLSelectElement)){setValue(el,value);mark(el,`Field: ${value}`);continue;}
+        if(value&&!(el instanceof HTMLSelectElement)){setValue(el,value);mark(el,`${canonical ? canonical.replace(/_/g," ") : "Field"}: ${value}`);continue;}
         const n=normalize(label);
         if(summary&&el instanceof HTMLTextAreaElement&&/professional summary|summary|about you|about me|introduction/.test(n)){setValue(el,summary);mark(el,"Generated resume summary");continue;}
         if(el.isContentEditable&&summary&&/summary|about|introduction/.test(n)){el.textContent=summary;fire(el,"input");fire(el,"change");mark(el,"Generated resume summary");}
@@ -670,10 +980,10 @@ async function autofillForTab(tabId) {
       window[HKEY]={at:Date.now()};
       return state;
     },
-    args: [profile, resume, settings, coverLetter, applicationAnswers, generatedCoverLetter]
+    args: [profile, resume, autofillSettings]
   });
   const result = results?.[0]?.result || { filled: 0, fileUploaded: false, coverLetterUploaded: false, details: [], unresolved: [], ats: "Generic" };
-  await setJobState(tabId, { autofill: result, pageUrl: job.jobUrl, autofilledAt: Date.now() });
+  await setJobState(tabId, { autofill: result, pageUrl: currentTab.url || job.pageUrl || job.jobUrl, pageType: "application", autofilledAt: Date.now() });
   return result;
 }
 
@@ -756,7 +1066,9 @@ async function generateForTab(tabId, payload) {
         jobTitle: payload.jobTitle,
         jobDescription: payload.jobDescription,
         jobUrl: payload.jobUrl,
-        jobSite: payload.jobSite
+        jobSite: payload.jobSite,
+        applicationId: current?.applicationId || undefined,
+        resumeTemplateId: payload.resumeTemplateId
       })
     });
     const data = await response.json().catch(() => ({}));
@@ -771,6 +1083,7 @@ async function generateForTab(tabId, payload) {
       resumeVersionId: data.resumeVersionId,
       error: null
     });
+    await bindApplicationToTab(tabId, data.applicationId, payload.jobUrl || current?.pageUrl || null);
   } catch (error) {
     const latest = await getJobState(tabId);
     if (latest?.jobContextId === contextId) {
@@ -788,15 +1101,120 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!tab.url || /^(chrome|edge|about|chrome-extension):/i.test(tab.url)) {
         throw new Error("Chrome cannot read this page. Open the job posting in a normal web tab.");
       }
+      const existing = await getJobState(tab.id);
       const result = await captureTab(tab.id);
-      await setJobState(tab.id, result.ok ? { ...result, jobContextId: newJobContextId(), status: "ready", error: null, applicationId: null, resumeVersionId: null, applicationAnswers: [], coverLetter: null, autofill: null, scan: null } : { ...result, status: "failed", error: result.error });
+      const resolvedApplicationId = existing?.applicationId || await resolveApplicationForUrl(result?.jobUrl || tab.url);
+      const restoredApplication = (!existing?.applicationId && resolvedApplicationId) ? await loadApplicationState(resolvedApplicationId) : null;
+      const sameApplication = Boolean(existing?.applicationId && result?.jobUrl && normalizeJobUrl(existing.jobUrl) === normalizeJobUrl(result.jobUrl));
+      await setJobState(tab.id, result.ok ? {
+        ...result,
+        jobContextId: existing?.applicationId ? (existing.jobContextId || newJobContextId()) : newJobContextId(),
+        status: "ready",
+        error: null,
+        applicationId: existing?.applicationId || resolvedApplicationId || null,
+        companyName: existing?.applicationId ? (existing.companyName || result.companyName) : (restoredApplication?.application?.company_name || result.companyName),
+        jobTitle: existing?.applicationId ? (existing.jobTitle || result.jobTitle) : (restoredApplication?.application?.job_title || result.jobTitle),
+        jobDescription: existing?.applicationId ? (existing.jobDescription || result.jobDescription) : (restoredApplication?.application?.job_description || result.jobDescription),
+        resumeVersionId: existing?.applicationId ? (existing.resumeVersionId || restoredApplication?.application?.resume_version_id || null) : (restoredApplication?.application?.resume_version_id || null),
+        resumeTemplateId: existing?.applicationId ? (existing.resumeTemplateId || restoredApplication?.application?.resume_template_id || "template_1") : (restoredApplication?.application?.resume_template_id || existing?.resumeTemplateId || "template_1"),
+        applicationAnswers: existing?.applicationId ? (existing.applicationAnswers || []) : [],
+        coverLetter: existing?.applicationId ? (existing.coverLetter || restoredApplication?.extensionState?.state?.coverLetter || null) : null,
+        autofill: existing?.applicationId ? (existing.autofill || null) : null,
+        scan: existing?.applicationId ? (existing.scan || null) : null
+      } : { ...result, status: "failed", error: result.error });
       sendResponse({ ...result, tabId: tab.id });
     }).catch((error) => sendResponse({ ok: false, error: error?.message || "Unable to capture the current page." }));
     return true;
   }
 
   if (message?.type === "GET_TAB_STATE") {
-    getJobState(message.tabId, message.url).then((state) => sendResponse({ ok: true, state })).catch((error) => sendResponse({ ok: false, error: error.message }));
+    (async () => {
+      const tabId = message.tabId || sender?.tab?.id;
+      if (!tabId) throw new Error("No tab context.");
+      const tab = await chrome.tabs.get(tabId);
+      const applicationId = await applicationContextForTab(tabId, message.url || tab?.url || null);
+      let state = await getJobState(tabId, message.url || tab?.url || null);
+      if (applicationId && (!state || state.applicationId !== applicationId)) {
+        const restored = await loadApplicationState(applicationId);
+        if (restored?.application) {
+          await setJobState(tabId, {
+            applicationId: restored.application.id,
+            profileId: restored.application.profile_id,
+            companyName: restored.application.company_name,
+            jobTitle: restored.application.job_title,
+            jobDescription: restored.application.job_description || "",
+            jobUrl: restored.application.job_url || "",
+            jobSite: restored.application.job_site || "",
+            applicationStatus: restored.application.status,
+            resumeVersionId: restored.application.resume_version_id,
+            resumeTemplateId: restored.application.resume_template_id || "template_1",
+            resumeUsed: restored.application.resume_used,
+            pageUrl: restored.extensionState?.page_url || tab?.url || restored.application.job_url || "",
+            pageType: restored.extensionState?.page_type || null,
+            applicationEvents: restored.events || [],
+            status: "restored"
+          });
+          state = await getJobState(tabId, message.url || tab?.url || null);
+        }
+      }
+      sendResponse({
+        ok: true,
+        state,
+        applicationId: applicationId || state?.applicationId || null,
+        page: state?.pageSnapshot || null
+      });
+    })().catch((error) => sendResponse({ ok: false, error: error?.message || "Unable to load tab state." }));
+    return true;
+  }
+
+
+  if (message?.type === "PAGE_AGENT_READY" || message?.type === "PAGE_AGENT_SNAPSHOT") {
+    const tabId = sender?.tab?.id;
+    if (!tabId) { sendResponse({ ok: false, error: "No tab context." }); return true; }
+    handlePageAgentSnapshot(tabId, message.snapshot, message.type === "PAGE_AGENT_READY" ? "PAGE_AGENT_READY" : "PAGE_DETECTED")
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || "Unable to process page state." }));
+    return true;
+  }
+
+  if (message?.type === "GET_APPLICATION_CONTEXT") {
+    (async () => {
+      const tabId = message.tabId || sender?.tab?.id;
+      if (!tabId) throw new Error("No tab context.");
+      const tab = await chrome.tabs.get(tabId);
+      const applicationId = await applicationContextForTab(tabId, message.url || tab?.url || null);
+      const state = applicationId ? await loadApplicationState(applicationId) : null;
+      sendResponse({ ok: true, applicationId, application: state?.application || null, extensionState: state?.extensionState || null, events: state?.events || [] });
+    })().catch((error) => sendResponse({ ok: false, error: error?.message || "Unable to load application context." }));
+    return true;
+  }
+
+  if (message?.type === "BIND_APPLICATION_TO_TAB") {
+    (async () => {
+      const tabId = message.tabId || sender?.tab?.id;
+      if (!tabId || !message.applicationId) throw new Error("tabId and applicationId are required.");
+      const tab = await chrome.tabs.get(tabId);
+      await bindApplicationToTab(tabId, message.applicationId, message.pageUrl || tab?.url || null);
+      const restored = await loadApplicationState(message.applicationId);
+      if (restored?.application) {
+        await setJobState(tabId, {
+          applicationId: restored.application.id,
+          profileId: restored.application.profile_id,
+          companyName: restored.application.company_name,
+          jobTitle: restored.application.job_title,
+          jobDescription: restored.application.job_description || '',
+          jobUrl: restored.application.job_url || '',
+          jobSite: restored.application.job_site || '',
+          applicationStatus: restored.application.status,
+          resumeVersionId: restored.application.resume_version_id,
+          resumeTemplateId: restored.application.resume_template_id || 'template_1',
+          resumeUsed: restored.application.resume_used,
+          pageUrl: message.pageUrl || tab?.url || restored.application.job_url || '',
+          status: 'restored',
+        });
+      }
+      sendResponse({ ok: true, application: restored?.application || null, extensionState: restored?.extensionState || null });
+    })().catch((error) => sendResponse({ ok: false, error: error?.message || "Unable to bind application." }));
     return true;
   }
 
@@ -880,7 +1298,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "CLEAR_TAB_STATE") {
-    chrome.storage.session.remove(`${JOB_PREFIX}${message.tabId}`).then(() => sendResponse({ ok: true }));
+    Promise.all([
+      chrome.storage.session.remove(`${JOB_PREFIX}${message.tabId}`),
+      chrome.storage.local.remove(`${TAB_APP_PREFIX}${message.tabId}`)
+    ]).then(() => sendResponse({ ok: true })).catch((error) => sendResponse({ ok: false, error: error?.message || "Unable to clear tab state." }));
     return true;
   }
 });
@@ -888,14 +1309,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!changeInfo.url) return;
   getJobState(tabId).then(async (job) => {
-    if (!job?.jobUrl) return;
-    const normalize = (value) => String(value || "").trim().toLowerCase().replace(/[?#&]jr_id=[^&#]*/g, "").replace(/\/$/, "");
-    if (normalize(changeInfo.url) !== normalize(job.jobUrl)) {
-      await chrome.storage.session.remove(`${JOB_PREFIX}${tabId}`);
-    }
+    const applicationId = job?.applicationId || await resolveApplicationForUrl(changeInfo.url);
+    if (!applicationId) return;
+    await bindApplicationToTab(tabId, applicationId, changeInfo.url);
+    await setJobState(tabId, {
+      applicationId,
+      pageUrl: changeInfo.url,
+      pageStatus: 'navigation',
+      // Navigation is page context, not application lifecycle. Preserve the
+      // current resume/application workflow state across ATS URL changes.
+      status: preserveWorkflowStatus(job?.status, 'ready')
+    });
+    await syncApplicationState(applicationId, {
+      activeTabId: String(tabId),
+      pageUrl: changeInfo.url,
+      pageType: job?.pageType || 'navigation',
+      state: { currentPageUrl: changeInfo.url },
+      eventType: 'PAGE_CHANGED',
+      eventPayload: { url: changeInfo.url }
+    });
+    notifySidePanel({
+      type: "APPLICATION_CONTEXT_CHANGED",
+      tabId,
+      applicationId,
+      page: { url: changeInfo.url, pageType: job?.pageType || "navigation", reason: "tabs_url_changed" }
+    });
   }).catch(() => {});
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  chrome.storage.session.remove(`${JOB_PREFIX}${tabId}`).catch(() => {});
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const applicationId = await applicationContextForTab(tabId, tab?.url || null);
+    if (!applicationId) return;
+    await getJobState(tabId, tab?.url || null);
+    await syncApplicationState(applicationId, {
+      activeTabId: String(tabId),
+      pageUrl: tab?.url || null,
+      pageType: 'active_tab',
+      state: { activeTab: true },
+      eventType: 'TAB_ACTIVATED',
+      eventPayload: { tabId, url: tab?.url || null }
+    });
+  } catch {}
+});
+
+chrome.runtime.onStartup?.addListener(async () => {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const liveTabIds = new Set(tabs.map((tab) => String(tab.id)));
+    const all = await chrome.storage.local.get(null);
+    const removals = Object.keys(all)
+      .filter((key) => key.startsWith(TAB_APP_PREFIX))
+      .filter((key) => !liveTabIds.has(key.slice(TAB_APP_PREFIX.length)));
+    if (removals.length) await chrome.storage.local.remove(removals);
+  } catch {}
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  // A tab binding is live-tab state. Remove it when the tab closes so a future
+  // Chrome tab-id reuse can never inherit the old application. The durable
+  // applicationUrl mappings and server-side application remain available for
+  // recovery in a newly opened tab.
+  await chrome.storage.session.remove(`${JOB_PREFIX}${tabId}`).catch(() => {});
+  await chrome.storage.local.remove(`${TAB_APP_PREFIX}${tabId}`).catch(() => {});
 });

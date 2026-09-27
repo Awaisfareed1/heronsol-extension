@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "HeronSol Job Assistant",
-  "version": "2.0.10",
-  "description": "HeronSol Job Assistant with centralized platform AI, tailored resumes, application autofill, batch questions, optional cover letters, materials, and resilient session handling.",
+  "version": "2.3.2",
+  "description": "HeronSol Job Assistant with persistent application workspaces, tab-bound application identity, navigation-safe workflow state, ATS-aware page intelligence, tailored resumes, application autofill, cover-letter autofill, batch questions, and resilient recovery.",
   "permissions": [
     "sidePanel",
     "storage",
@@ -31,5 +31,17 @@
       "description": "Open HeronSol Job Assistant side panel"
     }
   },
-  "options_page": "options.html"
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "ats-adapters.js",
+        "page-agent.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
 }
