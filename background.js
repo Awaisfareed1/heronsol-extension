@@ -38,7 +38,7 @@ chrome.runtime.onStartup.addListener(() => {
 
 async function baseUrl() {
   const data = await chrome.storage.local.get("heronsolBaseUrl");
-  return (data.heronsolBaseUrl || "http://localhost:3000/").replace(/\/+$/, "");
+  return (data.heronsolBaseUrl || "https://platform.totalynx.com/").replace(/\/+$/, "");
 }
 
 async function getSession() {

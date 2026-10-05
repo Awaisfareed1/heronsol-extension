@@ -1,3 +1,3 @@
 const url=document.getElementById("url"),status=document.getElementById("status");
-(async()=>{const data=await chrome.storage.local.get("heronsolBaseUrl");url.value=data.heronsolBaseUrl||"http://localhost:3000/";})();
+(async()=>{const data=await chrome.storage.local.get("heronsolBaseUrl");url.value=data.heronsolBaseUrl||"https://platform.totalynx.com/";})();
 document.getElementById("save").onclick=async()=>{let v=url.value.trim().replace(/\/+$/,"");if(!/^https?:\/\//i.test(v)){status.textContent="Use http:// or https://";status.className="status error";return}await chrome.storage.local.set({heronsolBaseUrl:v});status.textContent="Saved.";status.className="status ok"};
