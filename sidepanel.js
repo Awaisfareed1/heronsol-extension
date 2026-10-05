@@ -1,6 +1,6 @@
 const state={accessToken:null,refreshToken:null,expiresAt:null,bidder:null,profiles:[],templates:[],activeTabId:null,activeTabUrl:null,job:null,scan:null,settings:{},customFields:[],tabLoadToken:0,applicationId:null,pageContext:null,contextRefreshTimer:null};
 const $=id=>document.getElementById(id);
-async function baseUrl(){const d=await chrome.storage.local.get("heronsolBaseUrl");return(d.heronsolBaseUrl||"https://platform.totalynx.com/").replace(/\/+$/,"")}
+async function baseUrl(){const d=await chrome.storage.local.get("heronsolBaseUrl");return(d.heronsolBaseUrl||"http://localhost:3000/").replace(/\/+$/,"")}
 async function api(path,options={},retry=true){const url=await baseUrl();const makeRequest=()=>fetch(`${url}${path}`,{...options,headers:{"Content-Type":"application/json",...(options.headers||{}),...(state.accessToken?{Authorization:`Bearer ${state.accessToken}`}:{})}});let r=await makeRequest();if(r.status===401&&retry&&state.refreshToken){try{const refreshResponse=await fetch(`${url}/api/extension/auth`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"refresh",refreshToken:state.refreshToken})});const refreshData=await refreshResponse.json().catch(()=>({}));if(refreshResponse.ok&&refreshData.session){await setSession(refreshData);r=await api(path,options,false)}}catch{}}const is522=async(res)=>{if(![500,502,503,504].includes(res.status))return false;const type=res.headers.get("content-type")||"";if(!/text\/html/i.test(type))return false;const text=await res.clone().text().catch(()=>"");return /error code 522|connection timed out|cloudflare/i.test(text)};if(await is522(r)){for(const delay of [700,1500]){await new Promise(resolve=>setTimeout(resolve,delay));r=await makeRequest();if(!(await is522(r)))break}}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||`Request failed (${r.status})`);return d}
 async function setSession(d){state.accessToken=d.session.accessToken;state.refreshToken=d.session.refreshToken;state.expiresAt=d.session.expiresAt;state.bidder=d.bidder;state.profiles=d.profiles||[];await chrome.storage.local.set({accessToken:state.accessToken,refreshToken:state.refreshToken,expiresAt:state.expiresAt,bidder:state.bidder,profiles:state.profiles})}
 async function refresh(){if(!state.refreshToken)return false;const now=Math.floor(Date.now()/1000);if(state.expiresAt&&state.expiresAt>now+90)return true;try{const d=await api("/api/extension/auth",{method:"POST",body:JSON.stringify({action:"refresh",refreshToken:state.refreshToken})});await setSession(d);return true}catch{return false}}
@@ -25,21 +25,48 @@ function renderStateMonitor(){
 async function loadResumeTemplates(){
   const select=$("resumeTemplate");
   if(!select)return;
+  let templates=[];
   try{
-    const d=await api("/api/extension/applications",{method:"GET"});
-    state.templates=Array.isArray(d.templates)?d.templates:[];
+    // The platform is the single source of truth for available resume templates.
+    // Prefer the dedicated template endpoint; fall back to the application endpoint
+    // only for older platform deployments that expose templates there.
+    try{
+      const d=await api("/api/resume-templates",{method:"GET"});
+      templates=Array.isArray(d?.templates)?d.templates:Array.isArray(d)?d:[];
+    }catch{
+      const d=await api("/api/extension/applications",{method:"GET"});
+      templates=Array.isArray(d?.templates)?d.templates:[];
+    }
   }catch(error){
-    // Preserve the existing extension workflow if an older platform is still deployed.
-    state.templates=[
+    // Never invent templates when the platform cannot be reached.
+    // Keep only the two currently supported built-in templates as a safe fallback.
+    templates=[
       {id:"template_1",name:"Template 1",description:"Clean ATS structure"},
-      {id:"template_2",name:"Template 2",description:"Dense technical format"},
-      {id:"template_3",name:"Template 3",description:"Engineering-focused format"}
+      {id:"template_2",name:"Template 2",description:"Dense technical format"}
     ];
   }
-  const selected=state.job?.resumeTemplateId||"template_1";
+  // Normalize and de-duplicate the server response. Unsupported legacy template
+  // IDs are never displayed or sent back to the platform.
+  const seen=new Set();
+  state.templates=templates.filter(t=>{
+    const id=String(t?.id||t?.templateId||"");
+    if(!/^template_[1-2]$/.test(id)||seen.has(id))return false;
+    seen.add(id);
+    return true;
+  }).map(t=>({id:String(t.id||t.templateId),name:t.name||String(t.id||t.templateId),description:t.description||""}));
+  if(!state.templates.length){
+    state.templates=[
+      {id:"template_1",name:"Template 1",description:"Clean ATS structure"},
+      {id:"template_2",name:"Template 2",description:"Dense technical format"}
+    ];
+  }
+  const selected=state.job?.resumeTemplateId;
+  const validSelected=state.templates.some(t=>t.id===selected)?selected:state.templates[0].id;
+  if(state.job && state.job.resumeTemplateId!==validSelected){
+    state.job={...state.job,resumeTemplateId:validSelected};
+  }
   select.replaceChildren(...state.templates.map(t=>{const o=document.createElement("option");o.value=t.id;o.textContent=t.name;return o;}));
-  if(!select.options.length){const o=document.createElement("option");o.value="template_1";o.textContent="Template 1";select.appendChild(o)}
-  select.value=state.templates.some(t=>t.id===selected)?selected:(state.templates[0]?.id||"template_1");
+  select.value=validSelected;
 }
 function showLogin(){$("loginView").classList.remove("hidden");$("mainView").classList.add("hidden");$("settingsView").classList.add("hidden");$("logout").classList.add("hidden")}
 function showMain(){$("loginView").classList.add("hidden");$("settingsView").classList.add("hidden");$("mainView").classList.remove("hidden");$("logout").classList.remove("hidden");$("bidderName")?.remove();const p=$("profile");p.replaceChildren();state.profiles.forEach(x=>{const o=document.createElement("option");o.value=x.id;o.textContent=x.name;p.appendChild(o)});if(!state.profiles.length){const o=document.createElement("option");o.textContent="No assigned profiles";o.disabled=true;p.appendChild(o)} }
@@ -123,7 +150,7 @@ function renderJob(){
   $("jobBox").classList.remove("hidden");
   $("company").value=j.companyName||""; $("jobTitle").value=j.jobTitle||""; $("jobSite").value=j.jobSite||""; $("jobUrl").value=j.jobUrl||""; $("description").value=j.jobDescription||"";
   $("jobHeading").textContent=j.jobTitle||"Untitled role";
-  if($("resumeTemplate")){const selected=j.resumeTemplateId||"template_1";$("resumeTemplate").value=state.templates.some(t=>t.id===selected)?selected:(state.templates[0]?.id||"template_1");}
+  if($("resumeTemplate")){const selected=j.resumeTemplateId;const valid=state.templates.some(t=>t.id===selected)?selected:(state.templates[0]?.id||"template_1");$("resumeTemplate").value=valid;if(j.resumeTemplateId!==valid)state.job={...j,resumeTemplateId:valid};}
   const currentPage=(state.pageContext?.applicationStage||state.pageContext?.pageType||j.pageType||j.pageStatus||"").replace(/_/g," ");
   $("jobSubheading").textContent=currentPage ? [j.companyName,currentPage].filter(Boolean).join(" · ") : [j.companyName,j.jobSite].filter(Boolean).join(" · ");
   $("generate").disabled=["generating","downloading"].includes(j.status);
@@ -188,7 +215,7 @@ $("profile").onchange=async()=>{await loadSettings();state.scan=null;renderScan(
 $("settingsBtn").onclick=async()=>{$("mainView").classList.add("hidden");$("settingsView").classList.remove("hidden");await loadSettings()};$("closeSettings").onclick=()=>{$("settingsView").classList.add("hidden");$("mainView").classList.remove("hidden")};$("addCustom").onclick=()=>{state.customFields.push({key:"",value:""});renderCustom()};$("saveSettings").onclick=async()=>{if(!$("profile").value)return;try{const s=collectSettings();state.settings=s;$("saveSettings").disabled=true;$("saveSettings").textContent="Saving…";status("Saving extension settings…","busy");const saved=await chrome.runtime.sendMessage({type:"SAVE_EXTENSION_SETTINGS",profileId:$("profile").value,settings:s});if(!saved?.ok)throw new Error(saved?.error||"Unable to save extension settings.");state.settings=saved.settings||s;status("Extension settings saved to your HeronSol profile.","ok");$("settingsView").classList.add("hidden");$("mainView").classList.remove("hidden")}catch(error){status(error?.message||"Unable to save extension settings.","error")}finally{$("saveSettings").disabled=false;$("saveSettings").textContent="Save settings"}};
 document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 $("capture").onclick=async()=>{try{$("capture").disabled=true;status("Reading the job page…","busy");const r=await chrome.runtime.sendMessage({type:"CAPTURE_ACTIVE_TAB"});if(!r?.ok)throw new Error(r?.error||"Unable to read this page.");state.activeTabId=r.tabId;state.job=r;state.applicationId=r.applicationId||r.state?.applicationId||state.applicationId||null;state.scan=null;state.pageContext={url:r.pageUrl||state.activeTabUrl,pageType:"job",siteName:r.jobSite||null};renderWorkspace();renderJob();renderScan();switchTab("job");status("Job captured. Review the description before generating.","ok")}catch(e){status(e.message,"error")}finally{$("capture").disabled=false}};
-$("generate").onclick=async()=>{try{const p=state.profiles.find(x=>x.id===$("profile").value);if(!p)throw new Error("Select a profile first.");saveJob();const payload={profileId:p.id,profileName:p.name,companyName:$("company").value.trim(),jobTitle:$("jobTitle").value.trim(),jobDescription:$("description").value.trim(),jobUrl:$("jobUrl").value.trim(),jobSite:$("jobSite").value.trim(),resumeTemplateId:$("resumeTemplate").value||"template_1"};if(!payload.jobTitle||!payload.jobDescription)throw new Error("Job title and job description are required.");const r=await chrome.runtime.sendMessage({type:"GENERATE_FOR_TAB",tabId:state.activeTabId,payload,jobContextId:state.job?.jobContextId});if(!r?.ok)throw new Error(r.error);state.job={...state.job,...payload,status:"generating"};renderJob()}catch(e){status(e.message,"error")}};
+$("generate").onclick=async()=>{try{const p=state.profiles.find(x=>x.id===$("profile").value);if(!p)throw new Error("Select a profile first.");saveJob();const payload={profileId:p.id,profileName:p.name,companyName:$("company").value.trim(),jobTitle:$("jobTitle").value.trim(),jobDescription:$("description").value.trim(),jobUrl:$("jobUrl").value.trim(),jobSite:$("jobSite").value.trim(),resumeTemplateId:(state.templates.some(t=>t.id===$("resumeTemplate").value)?$("resumeTemplate").value:(state.templates[0]?.id||"template_1"))};if(!payload.jobTitle||!payload.jobDescription)throw new Error("Job title and job description are required.");const r=await chrome.runtime.sendMessage({type:"GENERATE_FOR_TAB",tabId:state.activeTabId,payload,jobContextId:state.job?.jobContextId});if(!r?.ok)throw new Error(r.error);state.job={...state.job,...payload,status:"generating"};renderJob()}catch(e){status(e.message,"error")}};
 $("scanApplication").onclick=async()=>{try{status("Scanning application controls…","busy");const r=await chrome.runtime.sendMessage({type:"SCAN_APPLICATION_FOR_TAB",tabId:state.activeTabId});if(!r?.ok)throw new Error(r.error);state.scan=r;renderScan();switchTab("apply");status(`Detected ${r.totalFields||0} fields and ${r.questions?.length||0} questions.`,"ok")}catch(e){status(e.message,"error")}};
 $("autofill").onclick=async()=>{try{status("Filling verified fields and real controls…","busy");const r=await chrome.runtime.sendMessage({type:"AUTOFILL_FOR_TAB",tabId:state.activeTabId});if(!r?.ok)throw new Error(r.error);state.job={...state.job,autofill:r};$("autofillResult").classList.remove("hidden");$("autofillResult").innerHTML=`<strong>${r.filled||0} field(s) filled</strong><ul>${(r.details||[]).slice(0,12).map(x=>`<li>${x}</li>`).join("")}</ul>${r.unresolved?.length?`<div>${r.unresolved.length} field(s) need review.</div>`:""}`;status("Autofill finished. The extension will not fight your edits.","ok")}catch(e){status(e.message,"error")}};
 $("downloadResume").onclick=async()=>{try{const r=await chrome.runtime.sendMessage({type:"DOWNLOAD_RESUME_FOR_TAB",tabId:state.activeTabId});if(!r?.ok)throw new Error(r?.error||"Unable to download the resume.");status(`Downloaded ${r.filename}.`,"ok")}catch(e){status(e.message,"error")}};
